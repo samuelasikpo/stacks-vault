@@ -198,3 +198,126 @@
     )
   )
 )
+
+;; CORE LENDING FUNCTIONS
+
+;; Deposit STX as collateral
+(define-public (deposit (amount uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    ;; Transfer STX from sender to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    ;; Update user's deposit balance
+    (map-set user-deposits tx-sender (+ (get-user-deposit tx-sender) amount))
+    ;; Update total deposits
+    (map-set total-deposits (get-current-stacks-block-height)
+      (+
+        (default-to u0
+          (map-get? total-deposits (get-current-stacks-block-height))
+        )
+        amount
+      ))
+    ;; Update total collateral
+    (var-set total-collateral (+ (var-get total-collateral) amount))
+    (ok amount)
+  )
+)
+
+;; Withdraw collateral (subject to loan health checks)
+(define-public (withdraw (amount uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (let ((current-deposit (get-user-deposit tx-sender)))
+      ;; Check if user has enough balance
+      (asserts! (>= current-deposit amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Transfer STX from contract to sender
+      (try! (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender)))
+      ;; Update user's deposit balance
+      (map-set user-deposits tx-sender (- current-deposit amount))
+      ;; Update total collateral
+      (var-set total-collateral (- (var-get total-collateral) amount))
+      (ok amount)
+    )
+  )
+)
+
+;; Create a new overcollateralized loan
+(define-public (borrow
+    (collateral-amount uint)
+    (loan-amount uint)
+  )
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> collateral-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> loan-amount u0) ERR-INVALID-AMOUNT)
+    (let (
+        (user-deposit (get-user-deposit tx-sender))
+        (collateral-value (* collateral-amount u1000))
+        (minimum-collateral-required (* loan-amount COLLATERAL-RATIO u10))
+        (loan-id (+ (var-get loan-nonce) u1))
+        (current-height (get-current-stacks-block-height))
+      )
+      ;; Validate collateral sufficiency
+      (asserts! (>= user-deposit collateral-amount) ERR-INSUFFICIENT-BALANCE)
+      (asserts! (>= collateral-value minimum-collateral-required)
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+      ;; Lock collateral
+      (map-set user-deposits tx-sender (- user-deposit collateral-amount))
+      ;; Create loan record
+      (map-set loans { loan-id: loan-id } {
+        borrower: tx-sender,
+        collateral-amount: collateral-amount,
+        loan-amount: loan-amount,
+        interest-accumulated: u0,
+        creation-height: current-height,
+        last-interest-height: current-height,
+        status: "active",
+      })
+      ;; Update user's loan list
+      (map-set user-loans tx-sender
+        (unwrap! (as-max-len? (append (get-user-loans tx-sender) loan-id) u20)
+          ERR-NOT-AUTHORIZED
+        ))
+      ;; Update counters
+      (var-set loan-nonce loan-id)
+      (var-set total-borrowed (+ (var-get total-borrowed) loan-amount))
+      ;; Transfer loan amount to borrower
+      (try! (as-contract (stx-transfer? loan-amount (as-contract tx-sender) tx-sender)))
+      (ok loan-id)
+    )
+  )
+)
+
+;; LOAN MANAGEMENT FUNCTIONS
+
+;; Update loan interest (internal function)
+(define-private (update-loan-interest (loan-id uint))
+  (match (get-loan-details loan-id)
+    loan-data (let (
+        (current-height (get-current-stacks-block-height))
+        (blocks-elapsed (- current-height (get last-interest-height loan-data)))
+        (loan-amount (get loan-amount loan-data))
+        (new-interest (calculate-interest loan-amount blocks-elapsed))
+        (current-interest (get interest-accumulated loan-data))
+        (updated-interest (+ current-interest new-interest))
+        (protocol-fee (/ (* new-interest PROTOCOL-FEE-PERCENT) u100))
+      )
+      ;; Update protocol fees
+      (map-set protocol-fees current-height
+        (+ (default-to u0 (map-get? protocol-fees current-height)) protocol-fee)
+      )
+      ;; Update loan with new interest
+      (map-set loans { loan-id: loan-id }
+        (merge loan-data {
+          interest-accumulated: updated-interest,
+          last-interest-height: current-height,
+        })
+      )
+      (ok updated-interest)
+    )
+    ERR-LOAN-NOT-FOUND
+  )
+)
