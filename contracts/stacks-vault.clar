@@ -97,3 +97,104 @@
     (ok paused-state)
   )
 )
+
+;; Withdraw accumulated protocol fees (admin only)
+(define-public (withdraw-protocol-fees (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (let (
+        (current-height (get-current-stacks-block-height))
+        (available-fees (default-to u0 (map-get? protocol-fees current-height)))
+      )
+      (asserts! (>= available-fees amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Transfer fees to contract owner
+      (try! (as-contract (stx-transfer? amount (as-contract tx-sender) CONTRACT-OWNER)))
+      ;; Update protocol fees
+      (map-set protocol-fees current-height (- available-fees amount))
+      (ok amount)
+    )
+  )
+)
+
+;; READ-ONLY HELPER FUNCTIONS
+
+;; Get current Stacks block height
+(define-read-only (get-current-stacks-block-height)
+  stacks-block-height
+)
+
+;; Get user's available deposit balance
+(define-read-only (get-user-deposit (user principal))
+  (default-to u0 (map-get? user-deposits user))
+)
+
+;; Get loan details by ID
+(define-read-only (get-loan-details (loan-id uint))
+  (map-get? loans { loan-id: loan-id })
+)
+
+;; Get all loan IDs for a user
+(define-read-only (get-user-loans (user principal))
+  (default-to (list) (map-get? user-loans user))
+)
+
+;; Get protocol statistics
+(define-read-only (get-protocol-stats)
+  {
+    total-collateral: (var-get total-collateral),
+    total-borrowed: (var-get total-borrowed),
+    protocol-fees: (default-to u0 (map-get? protocol-fees (get-current-stacks-block-height))),
+    loan-count: (var-get loan-nonce),
+  }
+)
+
+;; Calculate interest for a given principal and time period
+(define-read-only (calculate-interest
+    (principal-amount uint)
+    (blocks-elapsed uint)
+  )
+  (let (
+      (interest-per-block (/ (* principal-amount INTEREST-RATE-PER-BLOCK) u1000000))
+      (total-interest (* interest-per-block blocks-elapsed))
+    )
+    total-interest
+  )
+)
+
+;; Calculate collateral ratio for a loan
+(define-read-only (calculate-collateral-ratio
+    (collateral-amount uint)
+    (loan-amount uint)
+    (interest-accumulated uint)
+  )
+  (let ((total-debt (+ loan-amount interest-accumulated)))
+    (if (is-eq total-debt u0)
+      u0
+      (/ (* collateral-amount u1000) total-debt)
+    )
+  )
+)
+
+;; Check if a loan is eligible for liquidation
+(define-read-only (is-liquidatable (loan-id uint))
+  (if (or (> loan-id (var-get loan-nonce)) (is-none (get-loan-details loan-id)))
+    false
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (updated-interest (+ (get interest-accumulated loan-data)
+            (calculate-interest (get loan-amount loan-data)
+              (- (get-current-stacks-block-height)
+                (get last-interest-height loan-data)
+              ))
+          ))
+          (collateral-ratio (calculate-collateral-ratio (get collateral-amount loan-data)
+            (get loan-amount loan-data) updated-interest
+          ))
+        )
+        (< collateral-ratio (* LIQUIDATION-THRESHOLD u10))
+      )
+      false
+    )
+  )
+)
